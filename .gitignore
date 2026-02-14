@@ -21,4 +21,7 @@ sdist/
 var/
 *.egg-info/
 .installed.cfg
-*.egg 
+*.egg
+
+# Downloaded PDFs (test data, not for distribution)
+*.pdf
