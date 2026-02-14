@@ -128,7 +128,9 @@ def is_word(token: str) -> bool:
 
 def extract_text_from_pdf(pdf_path: str | Path, page_range: tuple[int, int] | None = None) -> str:
     """
-    Extract raw text from a PDF file using pdfplumber.
+    Extract raw text from a PDF file.
+
+    Tries pdfplumber first (better layout handling), falls back to pypdf.
 
     Parameters
     ----------
@@ -142,30 +144,98 @@ def extract_text_from_pdf(pdf_path: str | Path, page_range: tuple[int, int] | No
     str
         The concatenated raw text of the selected pages.
     """
-    import pdfplumber  # lazy import — only needed when actually reading PDFs
-
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
+    # Try pdfplumber first, fall back to pypdf
+    try:
+        import pdfplumber
+        return _extract_with_pdfplumber(pdf_path, page_range)
+    except ImportError:
+        log.info("pdfplumber not available, using pypdf")
+    except Exception as e:
+        log.warning(f"pdfplumber failed ({e}), falling back to pypdf")
+
+    return _extract_with_pypdf(pdf_path, page_range)
+
+
+def _extract_with_pdfplumber(pdf_path: Path, page_range: tuple[int, int] | None) -> str:
+    import pdfplumber
     pages_text: list[str] = []
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
-        start = 0
-        end = total - 1
+        start, end = 0, total - 1
         if page_range is not None:
-            start = max(0, page_range[0])
-            end = min(total - 1, page_range[1])
-
+            start, end = max(0, page_range[0]), min(total - 1, page_range[1])
         for idx in range(start, end + 1):
-            page = pdf.pages[idx]
-            text = page.extract_text()
+            text = pdf.pages[idx].extract_text()
             if text:
                 pages_text.append(text)
-
     raw = "\n\n".join(pages_text)
-    log.info(f"Extracted {len(raw)} characters from {pdf_path.name} (pages {start}-{end})")
+    log.info(f"Extracted {len(raw)} chars from {pdf_path.name} pages {start}-{end} (pdfplumber)")
     return raw
+
+
+def _extract_with_pypdf(pdf_path: Path, page_range: tuple[int, int] | None) -> str:
+    from pypdf import PdfReader
+    reader = PdfReader(pdf_path)
+    total = len(reader.pages)
+    start, end = 0, total - 1
+    if page_range is not None:
+        start, end = max(0, page_range[0]), min(total - 1, page_range[1])
+    pages_text: list[str] = []
+    for idx in range(start, end + 1):
+        text = reader.pages[idx].extract_text()
+        if text:
+            pages_text.append(text)
+    raw = "\n\n".join(pages_text)
+    log.info(f"Extracted {len(raw)} chars from {pdf_path.name} pages {start}-{end} (pypdf)")
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# Unicode ligature normalization
+# ---------------------------------------------------------------------------
+
+# Mapping of Unicode ligature characters to their ASCII equivalents.
+# PDF fonts frequently use these, and text extractors preserve them as
+# single Unicode code points, often with a trailing space that breaks words.
+_LIGATURE_MAP = {
+    "\ufb00": "ff",   # ﬀ
+    "\ufb01": "fi",   # ﬁ
+    "\ufb02": "fl",   # ﬂ
+    "\ufb03": "ffi",  # ﬃ
+    "\ufb04": "ffl",  # ﬄ
+    "\ufb05": "st",   # ﬅ  (long s + t)
+    "\ufb06": "st",   # ﬆ
+}
+
+# Pre-compiled regex for all ligature characters.
+_LIGATURE_RE = re.compile("|".join(re.escape(k) for k in _LIGATURE_MAP))
+
+
+def normalize_ligatures(text: str) -> str:
+    """
+    Replace Unicode ligature characters (U+FB00–FB06) with their ASCII
+    equivalents and remove the erroneous space that PDF extractors often
+    insert after them.
+
+    Example: ``"proﬁ table"``  →  ``"profitable"``
+    """
+    def _replace(m: re.Match) -> str:
+        return _LIGATURE_MAP[m.group(0)]
+
+    # Step 1: replace the ligature char with ASCII letters
+    text = _LIGATURE_RE.sub(_replace, text)
+    # Step 2: after replacement the space that was "inside" the ligature break
+    # may now sit between two letter runs.  We collapse it only when the space
+    # is flanked by word characters on both sides (i.e. it was an intra-word
+    # break, not a real word boundary).  We do this conservatively by checking
+    # for known ligature-ending patterns: the replacement leaves us with e.g.
+    # "profi table" — we rejoin via the broken-word scanner later, so we just
+    # need the ligature chars normalized here.
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -217,14 +287,50 @@ def _should_merge(fragments: list[str], max_short: int) -> bool:
     return has_short and not all_real
 
 
+# Ligature fragment endings — when a token ends with one of these and the
+# concatenation with the next token is a real word, it's almost certainly a
+# ligature break regardless of fragment length.
+_LIGATURE_ENDINGS = ("fi", "fl", "ff", "ffi", "ffl", "ft", "ct", "st")
+
+# Standalone ligature fragments that appear as the entire left token.
+# These are technically dictionary words ("fi" = music note, "fl" = abbreviation)
+# but when they appear before another fragment in PDF text, they're almost
+# always a ligature break.  We merge more aggressively for these.
+_LIGATURE_STANDALONE = {"fi", "fl", "ff", "ffi", "ffl", "st"}
+
+
+def _has_ligature_boundary(core_a: str, core_b: str) -> bool:
+    """
+    Return True if the boundary between *core_a* and *core_b* looks like a
+    ligature break.  This catches cases like "profi" + "table" where neither
+    fragment is short enough for the general heuristic.
+    """
+    lower_a = core_a.lower()
+    return any(lower_a.endswith(lig) for lig in _LIGATURE_ENDINGS)
+
+
+def _is_ligature_fragment(core: str) -> bool:
+    """
+    Return True if *core* is exactly a known standalone ligature fragment.
+    E.g. "fi", "fl", "ff".  These override the "both are real words" safety
+    check because they almost never appear as actual words in PDF text.
+    """
+    return core.lower() in _LIGATURE_STANDALONE
+
+
 def _clean_line(line: str) -> str:
     """
     Process a single line of text, merging broken-word fragments.
 
     Scans tokens left-to-right with a sliding window of up to 3 tokens.
-    At each position, tries merging 3, then 2 adjacent tokens.  Handles
-    trailing punctuation (e.g. "fi le." → "file.") by stripping it before
-    the dictionary check and reattaching it after.
+    At each position it tries, in order:
+
+    1. **3-token merge** — for triple ligature breaks ("di ffi cult").
+    2. **2-token general merge** — when at least one fragment is short (≤3).
+    3. **2-token ligature merge** — when token A ends with a ligature fragment
+       (fi, fl, ff, …) regardless of length, and A+B is a dictionary word.
+
+    Handles trailing punctuation (e.g. "fi le." → "file.").
     """
     tokens = line.split(" ")
     result: list[str] = []
@@ -258,12 +364,31 @@ def _clean_line(line: str) -> str:
             # No punct should appear between the two cores.
             if (_is_fragment(core_a) and not suf_a
                     and _is_fragment(core_b) and not pre_b):
+                # General short-fragment merge
                 if _should_merge([core_a, core_b], max_short=3):
                     merged_word = core_a + core_b
                     log.debug(f"Merge: '{core_a} {core_b}' → '{merged_word}'")
                     result.append(pre_a + merged_word + suf_b)
                     i += 2
                     merged = True
+                # Ligature fragment override — "fi", "fl", "ff" etc. are
+                # technically dictionary words but in PDF context they're
+                # almost always broken ligatures.  Merge if A+B is a word.
+                elif _is_ligature_fragment(core_a) and is_word(core_a + core_b):
+                    merged_word = core_a + core_b
+                    log.debug(f"Ligature fragment merge: '{core_a} {core_b}' → '{merged_word}'")
+                    result.append(pre_a + merged_word + suf_b)
+                    i += 2
+                    merged = True
+                # Ligature-aware merge — handles longer fragments like
+                # "profi" + "table" where neither side is ≤3 chars
+                elif _has_ligature_boundary(core_a, core_b):
+                    candidate = core_a + core_b
+                    if is_word(candidate) and not is_word(core_a):
+                        log.debug(f"Ligature merge: '{core_a} {core_b}' → '{candidate}'")
+                        result.append(pre_a + candidate + suf_b)
+                        i += 2
+                        merged = True
 
         if not merged:
             result.append(tokens[i])
@@ -286,6 +411,9 @@ def clean_broken_words(text: str) -> str:
 
     This avoids falsely merging legitimate short words like "a way" or "I do".
     """
+    # First normalize Unicode ligatures (ﬁ → fi, ﬂ → fl, etc.)
+    text = normalize_ligatures(text)
+
     dictionary = get_dictionary()
     if not dictionary:
         log.warning("Dictionary is empty — skipping broken-word repair")

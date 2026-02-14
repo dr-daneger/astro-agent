@@ -1,7 +1,10 @@
 """Tests for pdf_text_cleanup module."""
 
 import textwrap
-from pdf_text_cleanup import clean_broken_words, clean_extra_whitespace, is_word
+from pdf_text_cleanup import (
+    clean_broken_words, clean_extra_whitespace, is_word,
+    normalize_ligatures,
+)
 
 
 # ---- Dictionary sanity check ----
@@ -117,6 +120,83 @@ def test_realistic_paragraph():
     assert "fi rst" not in cleaned
     assert "di ffi cult" not in cleaned
     assert "fi nding" not in cleaned
+
+
+# ---- Unicode ligature normalization ----
+
+def test_normalize_fi_ligature():
+    """ﬁ (U+FB01) should be replaced with 'fi'."""
+    assert normalize_ligatures("pro\ufb01table") == "profitable"
+
+
+def test_normalize_fl_ligature():
+    """ﬂ (U+FB02) should be replaced with 'fl'."""
+    assert normalize_ligatures("\ufb02ow") == "flow"
+
+
+def test_normalize_ff_ligature():
+    assert normalize_ligatures("e\ufb00ect") == "effect"
+
+
+def test_normalize_ffi_ligature():
+    assert normalize_ligatures("di\ufb03cult") == "difficult"
+
+
+def test_normalize_preserves_normal_text():
+    text = "This is normal text without ligatures."
+    assert normalize_ligatures(text) == text
+
+
+# ---- Ligature-aware merge (longer fragments) ----
+
+def test_ligature_merge_profitable():
+    """'profi table' — both fragments are >3 chars but it's a ligature break."""
+    result = clean_broken_words("This was profi table for everyone.")
+    assert "profitable" in result
+    assert "profi table" not in result
+
+
+def test_ligature_merge_field():
+    """'fi eld' — 'fi' is technically a word but here it's a ligature."""
+    result = clean_broken_words("cutting edge of their fi eld")
+    assert "field" in result
+
+
+def test_ligature_merge_figures():
+    result = clean_broken_words("List of fi gures vii")
+    assert "figures" in result
+
+
+def test_ligature_merge_benefited():
+    result = clean_broken_words("He benefi ted from the change.")
+    assert "benefited" in result
+
+
+def test_ligature_merge_with_punctuation():
+    """'profi table.' should become 'profitable.'"""
+    result = clean_broken_words("This was profi table.")
+    assert "profitable." in result
+
+
+# ---- Allen 2009 style text ----
+
+def test_allen2009_paragraph():
+    """Text modeled on actual output from Allen 2009 frontmatter PDF."""
+    broken = (
+        "were uniquely profi table to invent and use in Britain. "
+        "The high wage economy of pre-industrial Britain also "
+        "fostered industrial development. He benefi ted enormously "
+        "from the cutting edge of their fi eld with an ability to "
+        "write clearly. List of fi gures vii."
+    )
+    cleaned = clean_broken_words(broken)
+    assert "profitable" in cleaned
+    assert "benefited" in cleaned
+    assert "field" in cleaned
+    assert "figures" in cleaned
+    assert "profi table" not in cleaned
+    assert "fi eld" not in cleaned
+    assert "fi gures" not in cleaned
 
 
 # ---- Edge cases ----
